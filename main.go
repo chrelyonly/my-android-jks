@@ -200,9 +200,16 @@ func generateAPKCert(cfg *Config) (*CertInfo, error) {
 	// 保存到 JKS
 	os.MkdirAll("build", 0755)
 	ks := keystore.New()
+
+	// 使用 PKCS#8 格式序列化私钥
+	privateKeyBytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+
 	entry := keystore.PrivateKeyEntry{
 		CreationTime:     time.Now(),
-		PrivateKey:       x509.MarshalPKCS1PrivateKey(key),
+		PrivateKey:       privateKeyBytes,
 		CertificateChain: []keystore.Certificate{{Type: "X509", Content: certBytes}},
 	}
 	if err := ks.SetPrivateKeyEntry(cfg.Keystore.KeyAlias, entry, []byte(cfg.Keystore.KeyPass)); err != nil {
