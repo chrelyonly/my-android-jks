@@ -102,9 +102,6 @@ jobs:
             cp "${BASE_NAME}" "$PACKAGE_DIR/"
           fi
 
-          # 拷贝证书文件（来自仓库根目录）
-          cp ../server.key "$PACKAGE_DIR/"
-          cp ../server.pem "$PACKAGE_DIR/"
 
           # 打包
           if [ "${{ matrix.goos }}" = "windows" ]; then
