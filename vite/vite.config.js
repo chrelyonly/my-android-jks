@@ -22,12 +22,12 @@ export default defineConfig({
   server: {
     allowedHosts: true,
     proxy: {
-      '/generate': {
-        target: 'http://localhost:8080/generate',
+      '/generate-apk-cert': {
+        target: 'http://localhost:8080/generate-apk-cert',
         // target: 'https://music-app.chrelyonly.cn/api/',
         changeOrigin: true,
         ws: true,
-        rewrite: path => path.replace(/^\/generate/, ''),
+        rewrite: path => path.replace(/^\/generate-apk-cert/, ''),
       },
     },
   },
