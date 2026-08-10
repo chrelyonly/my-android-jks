@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
@@ -8,35 +10,29 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"embed"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"log"
+	"io/fs"
 	"math/big"
-	"os"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/pavlo-v-chernykh/keystore-go/v4"
 )
 
-const (
-	RSABitsSize    = 2048
-	ConfigFilename = "build/config.json"
-)
+const RSABitsSize = 2048
 
-// JSON 配置结构体
-type Config struct {
-	Keystore KeystoreConfig `json:"keystore"`
-	CA       CAConfig       `json:"ca"`
-}
+// ===== 请求与响应数据结构定义 =====
 
 type KeystoreConfig struct {
-	FilePath string `json:"filePath"`
-	Password string `json:"password"`
-	KeyAlias string `json:"keyAlias"`
-	KeyPass  string `json:"keyPass"`
+	FileName string `json:"fileName"` // 生成文件名，如 "my-release-key.jks"
+	Password string `json:"password"` // Keystore 密码
+	KeyAlias string `json:"keyAlias"` // 别名
+	KeyPass  string `json:"keyPass"`  // Key 密码
 }
 
 type CAConfig struct {
@@ -48,6 +44,11 @@ type CAConfig struct {
 	ValidityYears      int    `json:"validityYears"`
 }
 
+type GenerateAPKCertRequest struct {
+	Keystore KeystoreConfig `json:"keystore"`
+	CA       CAConfig       `json:"ca"`
+}
+
 type CertInfo struct {
 	SerialNumber      string
 	Subject           string
@@ -57,35 +58,228 @@ type CertInfo struct {
 	MD5Fingerprint    string
 	SHA1Fingerprint   string
 	SHA256Fingerprint string
+	MD5Formatted      string // Android 常用带冒号大写格式
+	SHA1Formatted     string
+	SHA256Formatted   string
 }
 
-// 生成RSA私钥
-func GenRsaPK(size int) (*rsa.PrivateKey, error) {
-	return rsa.GenerateKey(rand.Reader, size)
+//go:embed public/*
+var staticFS embed.FS
+
+func main() {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.Default()
+	r.Use(corsMiddleware())
+
+	// ===== 路由配置 =====
+	r.POST("/generate-apk-cert", handleGenerateAPKCert)
+
+	// ===== 静态资源与 SPA 路由适配 =====
+	subFS, err := fs.Sub(staticFS, "public")
+	if err != nil {
+		// 没有 public 目录时不会崩溃，方便单独作为纯后端 API 运行
+		fmt.Printf("⚠️ 提示: 未找到静态资源目录 public: %v\n", err)
+	} else {
+		httpFS := http.FS(subFS)
+		r.NoRoute(func(c *gin.Context) {
+			path := c.Request.URL.Path
+			if strings.HasPrefix(path, "/generate") {
+				return
+			}
+			f, err := subFS.Open(strings.TrimPrefix(path, "/"))
+			if err == nil {
+				_ = f.Close()
+				http.FileServer(httpFS).ServeHTTP(c.Writer, c.Request)
+				return
+			}
+			c.Request.URL.Path = "/"
+			http.FileServer(httpFS).ServeHTTP(c.Writer, c.Request)
+		})
+	}
+
+	fmt.Println("🚀 Android APK 证书签发 Web 服务已启动于 :8080...")
+	if err := r.Run(":8080"); err != nil {
+		fmt.Printf("❌ 服务启动失败: %v\n", err)
+	}
 }
 
-// 计算证书指纹
-func calculateFingerprints(certBytes []byte) (md5Str, sha1Str, sha256Str string) {
-	md5Hash := md5.Sum(certBytes)
-	md5Str = hex.EncodeToString(md5Hash[:])
+// ===== HTTP 接口处理函数 =====
 
-	sha1Hash := sha1.Sum(certBytes)
-	sha1Str = hex.EncodeToString(sha1Hash[:])
+func handleGenerateAPKCert(c *gin.Context) {
+	var req GenerateAPKCertRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数解析失败: " + err.Error()})
+		return
+	}
 
-	sha256Hash := sha256.Sum256(certBytes)
-	sha256Str = hex.EncodeToString(sha256Hash[:])
+	// 补全默认参数
+	fillDefaultConfig(&req)
 
-	return
+	// 生成 JKS 字节数组和证书详情信息
+	jksBytes, certInfo, err := generateAPKCertBytes(&req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成 APK 证书失败: " + err.Error()})
+		return
+	}
+
+	// 生成格式化的文本说明
+	infoText := buildCertInfoText(&req, certInfo)
+
+	// 打包 ZIP 字节流
+	zipBuf := new(bytes.Buffer)
+	zipWriter := zip.NewWriter(zipBuf)
+
+	// 写入 .jks 文件
+	jksFileName := req.Keystore.FileName
+	if !strings.HasSuffix(jksFileName, ".jks") {
+		jksFileName += ".jks"
+	}
+	if err := addFileToZip(zipWriter, jksFileName, jksBytes); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "打包 JKS 文件失败: " + err.Error()})
+		return
+	}
+
+	// 写入 证书信息说明 .txt 文件
+	infoFileName := strings.TrimSuffix(jksFileName, filepath.Ext(jksFileName)) + "-info.txt"
+	if err := addFileToZip(zipWriter, infoFileName, []byte(infoText)); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "打包说明文件失败: " + err.Error()})
+		return
+	}
+
+	if err := zipWriter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "关闭 ZIP 流失败: " + err.Error()})
+		return
+	}
+
+	// 返回 zip 流
+	c.Header("Content-Disposition", "attachment; filename=apk-keystore.zip")
+	c.Header("Content-Type", "application/zip")
+	c.Data(http.StatusOK, "application/zip", zipBuf.Bytes())
 }
 
-// 解析证书信息
+// ===== 核心证书生成逻辑（纯内存操作） =====
+
+func generateAPKCertBytes(cfg *GenerateAPKCertRequest) ([]byte, *CertInfo, error) {
+	key, err := rsa.GenerateKey(rand.Reader, RSABitsSize)
+	if err != nil {
+		return nil, nil, fmt.Errorf("生成 RSA 密钥对失败: %w", err)
+	}
+
+	subject := pkix.Name{
+		Country:            []string{cfg.CA.Country},
+		Province:           []string{cfg.CA.Province},
+		Organization:       []string{cfg.CA.Organization},
+		OrganizationalUnit: []string{cfg.CA.OrganizationalUnit},
+		CommonName:         cfg.CA.CommonName,
+	}
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, nil, fmt.Errorf("生成序列号失败: %w", err)
+	}
+
+	certTemplate := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject:      subject,
+		NotBefore:    time.Now().Add(-10 * time.Minute),
+		NotAfter:     time.Now().AddDate(cfg.CA.ValidityYears, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+	}
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, certTemplate, certTemplate, &key.PublicKey, key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建 x509 证书失败: %w", err)
+	}
+
+	certInfo, err := parseCertInfo(certBytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("解析证书信息失败: %w", err)
+	}
+
+	// 转换为 JKS 格式
+	ks := keystore.New()
+	privateKeyBytes := x509.MarshalPKCS1PrivateKey(key)
+
+	entry := keystore.PrivateKeyEntry{
+		CreationTime:     time.Now(),
+		PrivateKey:       privateKeyBytes,
+		CertificateChain: []keystore.Certificate{{Type: "X509", Content: certBytes}},
+	}
+
+	if err := ks.SetPrivateKeyEntry(cfg.Keystore.KeyAlias, entry, []byte(cfg.Keystore.KeyPass)); err != nil {
+		return nil, nil, fmt.Errorf("写入 KeyStore 失败: %w", err)
+	}
+
+	jksBuf := new(bytes.Buffer)
+	if err := ks.Store(jksBuf, []byte(cfg.Keystore.Password)); err != nil {
+		return nil, nil, fmt.Errorf("导出 KeyStore 字节流失败: %w", err)
+	}
+
+	return jksBuf.Bytes(), certInfo, nil
+}
+
+// ===== 工具函数与辅助处理 =====
+
+func fillDefaultConfig(req *GenerateAPKCertRequest) {
+	if req.Keystore.FileName == "" {
+		req.Keystore.FileName = "release-key.jks"
+	}
+	if req.Keystore.Password == "" {
+		req.Keystore.Password = "chrelyonly"
+	}
+	if req.Keystore.KeyAlias == "" {
+		req.Keystore.KeyAlias = "chrelyonly"
+	}
+	if req.Keystore.KeyPass == "" {
+		req.Keystore.KeyPass = "chrelyonly"
+	}
+
+	if req.CA.Country == "" {
+		req.CA.Country = "CN"
+	}
+	if req.CA.Province == "" {
+		req.CA.Province = "Yunnan"
+	}
+	if req.CA.Organization == "" {
+		req.CA.Organization = "chrelyonly"
+	}
+	if req.CA.OrganizationalUnit == "" {
+		req.CA.OrganizationalUnit = "chrelyonly"
+	}
+	if req.CA.CommonName == "" {
+		req.CA.CommonName = "chrelyonly"
+	}
+	if req.CA.ValidityYears <= 0 {
+		req.CA.ValidityYears = 30
+	}
+}
+
+func formatFingerprint(hexStr string) string {
+	hexStr = strings.ToUpper(hexStr)
+	var result []string
+	for i := 0; i < len(hexStr); i += 2 {
+		if i+2 <= len(hexStr) {
+			result = append(result, hexStr[i:i+2])
+		}
+	}
+	return strings.Join(result, ":")
+}
+
 func parseCertInfo(certBytes []byte) (*CertInfo, error) {
 	cert, err := x509.ParseCertificate(certBytes)
 	if err != nil {
 		return nil, err
 	}
 
-	md5Str, sha1Str, sha256Str := calculateFingerprints(certBytes)
+	md5Hash := md5.Sum(certBytes)
+	md5Str := hex.EncodeToString(md5Hash[:])
+
+	sha1Hash := sha1.Sum(certBytes)
+	sha1Str := hex.EncodeToString(sha1Hash[:])
+
+	sha256Hash := sha256.Sum256(certBytes)
+	sha256Str := hex.EncodeToString(sha256Hash[:])
 
 	return &CertInfo{
 		SerialNumber:      cert.SerialNumber.String(),
@@ -96,199 +290,73 @@ func parseCertInfo(certBytes []byte) (*CertInfo, error) {
 		MD5Fingerprint:    md5Str,
 		SHA1Fingerprint:   sha1Str,
 		SHA256Fingerprint: sha256Str,
+		MD5Formatted:      formatFingerprint(md5Str),
+		SHA1Formatted:     formatFingerprint(sha1Str),
+		SHA256Formatted:   formatFingerprint(sha256Str),
 	}, nil
 }
 
-// 生成带时间戳的文件名
-func generateTimestampedFilename(basePath string) (string, string) {
-	timestamp := time.Now().Format("20060102-150405")
-	ext := filepath.Ext(basePath)
-	base := basePath[:len(basePath)-len(ext)]
+func buildCertInfoText(cfg *GenerateAPKCertRequest, certInfo *CertInfo) string {
+	divider := "=" + strings.Repeat("=", 58) + "\n"
+	subDivider := "-" + strings.Repeat("-", 58) + "\n"
 
-	jksPath := fmt.Sprintf("%s-%s%s", base, timestamp, ext)
-	infoPath := fmt.Sprintf("%s-%s.txt", base, timestamp)
+	var sb strings.Builder
+	sb.WriteString(divider)
+	sb.WriteString("Android APK 签名证书信息\n")
+	sb.WriteString(divider + "\n")
 
-	return jksPath, infoPath
+	sb.WriteString("Keystore 配置信息：\n")
+	sb.WriteString(subDivider)
+	sb.WriteString(fmt.Sprintf("文件名称:     %s\n", cfg.Keystore.FileName))
+	sb.WriteString(fmt.Sprintf("Key Alias:    %s\n", cfg.Keystore.KeyAlias))
+	sb.WriteString(fmt.Sprintf("Keystore 密码:%s\n", cfg.Keystore.Password))
+	sb.WriteString(fmt.Sprintf("Key 密码:     %s\n", cfg.Keystore.KeyPass))
+	sb.WriteString("\n")
+
+	sb.WriteString("证书详情：\n")
+	sb.WriteString(subDivider)
+	sb.WriteString(fmt.Sprintf("序列号: %s\n", certInfo.SerialNumber))
+	sb.WriteString(fmt.Sprintf("主题:   %s\n", certInfo.Subject))
+	sb.WriteString(fmt.Sprintf("有效期: %s 至 %s\n", certInfo.NotBefore, certInfo.NotAfter))
+	sb.WriteString("\n")
+
+	sb.WriteString("Android 开发者常用指纹 (微信/Google等开放平台绑定用)：\n")
+	sb.WriteString(subDivider)
+	sb.WriteString(fmt.Sprintf("MD5:    %s\n", certInfo.MD5Formatted))
+	sb.WriteString(fmt.Sprintf("SHA1:   %s\n", certInfo.SHA1Formatted))
+	sb.WriteString(fmt.Sprintf("SHA256: %s\n", certInfo.SHA256Formatted))
+	sb.WriteString("\n")
+
+	sb.WriteString("原始指纹 (HEX)：\n")
+	sb.WriteString(subDivider)
+	sb.WriteString(fmt.Sprintf("MD5:    %s\n", certInfo.MD5Fingerprint))
+	sb.WriteString(fmt.Sprintf("SHA1:   %s\n", certInfo.SHA1Fingerprint))
+	sb.WriteString(fmt.Sprintf("SHA256: %s\n", certInfo.SHA256Fingerprint))
+	sb.WriteString(divider)
+
+	return sb.String()
 }
 
-// 保存证书信息到文件
-func saveCertInfoToFile(filename string, cfg *Config, certInfo *CertInfo) error {
-	file, err := os.Create(filename)
+func addFileToZip(zw *zip.Writer, filename string, content []byte) error {
+	f, err := zw.Create(filename)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
-	fmt.Fprintf(file, "="+strings.Repeat("=", 50)+"\n")
-	fmt.Fprintf(file, "APK签名证书信息\n")
-	fmt.Fprintf(file, "="+strings.Repeat("=", 50)+"\n\n")
-
-	fmt.Fprintf(file, "证书信息：\n")
-	fmt.Fprintf(file, "-"+strings.Repeat("-", 50)+"\n")
-	fmt.Fprintf(file, "Keystore 路径: %s\n", cfg.Keystore.FilePath)
-	fmt.Fprintf(file, "Key Alias: %s\n", cfg.Keystore.KeyAlias)
-	fmt.Fprintf(file, "Keystore 密码: %s\n", cfg.Keystore.Password)
-	fmt.Fprintf(file, "Key 密码: %s\n", cfg.Keystore.KeyPass)
-	fmt.Fprintf(file, "\n")
-
-	fmt.Fprintf(file, "证书详情：\n")
-	fmt.Fprintf(file, "序列号: %s\n", certInfo.SerialNumber)
-	fmt.Fprintf(file, "主题: %s\n", certInfo.Subject)
-	fmt.Fprintf(file, "颁发者: %s\n", certInfo.Issuer)
-	fmt.Fprintf(file, "有效期: %s 至 %s\n", certInfo.NotBefore, certInfo.NotAfter)
-	fmt.Fprintf(file, "\n")
-
-	fmt.Fprintf(file, "证书指纹：\n")
-	fmt.Fprintf(file, "MD5: %s\n", certInfo.MD5Fingerprint)
-	fmt.Fprintf(file, "SHA1: %s\n", certInfo.SHA1Fingerprint)
-	fmt.Fprintf(file, "SHA256: %s\n", certInfo.SHA256Fingerprint)
-	fmt.Fprintf(file, "="+strings.Repeat("=", 50)+"\n")
-
-	return nil
+	_, err = f.Write(content)
+	return err
 }
 
-// 从 JSON 文件读取配置
-func loadConfig(filename string) (*Config, error) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
-}
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, Authorization")
+		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
 
-// 生成自签名证书和 keystore
-func generateAPKCert(cfg *Config) (*CertInfo, error) {
-	key, err := GenRsaPK(RSABitsSize)
-	if err != nil {
-		return nil, err
-	}
-
-	// 构建证书主题信息
-	subject := pkix.Name{
-		Country:            []string{cfg.CA.Country},
-		Province:           []string{cfg.CA.Province},
-		Organization:       []string{cfg.CA.Organization},
-		OrganizationalUnit: []string{cfg.CA.OrganizationalUnit},
-		CommonName:         cfg.CA.CommonName,
-	}
-
-	// 证书模板
-	certTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		Subject:      subject,
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().AddDate(cfg.CA.ValidityYears, 0, 0),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-	}
-
-	// 自签名证书
-	certBytes, err := x509.CreateCertificate(rand.Reader, certTemplate, certTemplate, &key.PublicKey, key)
-	if err != nil {
-		return nil, err
-	}
-
-	// 解析证书信息
-	certInfo, err := parseCertInfo(certBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	// 保存到 JKS
-	os.MkdirAll("build", 0755)
-	ks := keystore.New()
-
-	// 使用 PKCS#8 格式序列化私钥
-	privateKeyBytes, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		return nil, err
-	}
-
-	entry := keystore.PrivateKeyEntry{
-		CreationTime:     time.Now(),
-		PrivateKey:       privateKeyBytes,
-		CertificateChain: []keystore.Certificate{{Type: "X509", Content: certBytes}},
-	}
-	if err := ks.SetPrivateKeyEntry(cfg.Keystore.KeyAlias, entry, []byte(cfg.Keystore.KeyPass)); err != nil {
-		return nil, err
-	}
-
-	f, err := os.Create(cfg.Keystore.FilePath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	if err := ks.Store(f, []byte(cfg.Keystore.Password)); err != nil {
-		return nil, err
-	}
-
-	return certInfo, nil
-}
-
-func main() {
-	// 尝试读取配置
-	cfg, err := loadConfig(ConfigFilename)
-	if err != nil {
-		log.Println("加载配置失败，使用默认值")
-		cfg = &Config{
-			Keystore: KeystoreConfig{
-				FilePath: "build/my-release-key.jks",
-				Password: "chrelyonly",
-				KeyAlias: "chrelyonly",
-				KeyPass:  "chrelyonly",
-			},
-			CA: CAConfig{
-				Country:            "CN",
-				Province:           "Yunnan",
-				Organization:       "chrelyonly",
-				OrganizationalUnit: "chrelyonly",
-				CommonName:         "chrelyonly CA",
-				ValidityYears:      100,
-			},
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
 		}
+		c.Next()
 	}
-
-	// 生成带时间戳的文件名
-	jksPath, infoPath := generateTimestampedFilename(cfg.Keystore.FilePath)
-
-	// 更新配置中的文件路径
-	cfg.Keystore.FilePath = jksPath
-
-	certInfo, err := generateAPKCert(cfg)
-	if err != nil {
-		log.Fatalf("生成APK签名证书失败: %v", err)
-	}
-
-	// 保存证书信息到文件
-	if err := saveCertInfoToFile(infoPath, cfg, certInfo); err != nil {
-		log.Printf("保存证书信息文件失败: %v", err)
-	}
-
-	fmt.Println("=" + strings.Repeat("=", 50))
-	fmt.Println("APK签名证书生成成功！")
-	fmt.Println("=" + strings.Repeat("=", 50))
-	fmt.Println()
-	fmt.Println("证书信息：")
-	fmt.Println("-" + strings.Repeat("-", 50))
-	fmt.Printf("Keystore 路径: %s\n", cfg.Keystore.FilePath)
-	fmt.Printf("证书信息文件: %s\n", infoPath)
-	fmt.Printf("Key Alias: %s\n", cfg.Keystore.KeyAlias)
-	fmt.Printf("Keystore 密码: %s\n", cfg.Keystore.Password)
-	fmt.Printf("Key 密码: %s\n", cfg.Keystore.KeyPass)
-	fmt.Println()
-	fmt.Println("证书详情：")
-	fmt.Printf("序列号: %s\n", certInfo.SerialNumber)
-	fmt.Printf("主题: %s\n", certInfo.Subject)
-	fmt.Printf("颁发者: %s\n", certInfo.Issuer)
-	fmt.Printf("有效期: %s 至 %s\n", certInfo.NotBefore, certInfo.NotAfter)
-	fmt.Println()
-	fmt.Println("证书指纹：")
-	fmt.Printf("MD5: %s\n", certInfo.MD5Fingerprint)
-	fmt.Printf("SHA1: %s\n", certInfo.SHA1Fingerprint)
-	fmt.Printf("SHA256: %s\n", certInfo.SHA256Fingerprint)
-	fmt.Println("=" + strings.Repeat("=", 50))
 }

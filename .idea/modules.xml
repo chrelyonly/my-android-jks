@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/my-android-jks.iml" filepath="$PROJECT_DIR$/.idea/my-android-jks.iml" />
+      <module fileurl="file://$PROJECT_DIR$/vite/vite.iml" filepath="$PROJECT_DIR$/vite/vite.iml" />
     </modules>
   </component>
 </project>
