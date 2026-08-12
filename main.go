@@ -199,7 +199,11 @@ func generateAPKCertBytes(cfg *GenerateAPKCertRequest) ([]byte, *CertInfo, error
 
 	// 转换为 JKS 格式
 	ks := keystore.New()
-	privateKeyBytes := x509.MarshalPKCS1PrivateKey(key)
+	// ✅ 正确：使用 PKCS#8 格式序列化私钥
+	privateKeyBytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("序列化私钥失败(PKCS#8): %w", err)
+	}
 
 	entry := keystore.PrivateKeyEntry{
 		CreationTime:     time.Now(),
